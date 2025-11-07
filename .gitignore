@@ -1,0 +1,30 @@
+# oya-blocker/.gitignore
+
+### Rust Server ###
+# ビルド成果物
+/rust-server/target/
+# 秘密の環境変数ファイル (.env, .env.local など)
+/rust-server/.env*
+# ただし、テンプレートファイルは無視しない
+!/rust-server/.env.example
+# Cargo.lock (リポジトリに含めることが多いですが、ライブラリ開発でない場合は無視する選択もあります)
+# /rust-server/Cargo.lock
+
+
+### M5Stack (PlatformIO) ###
+# PlatformIOの作業ディレクトリ
+/m5stack-client/.pio/
+# VSCodeなどのエディタ設定
+/m5stack-client/.vscode/
+# 秘密のINIファイル
+/m5stack-client/secret.ini
+
+
+### OS / Editor Common ###
+# macOS
+.DS_Store
+# Windows
+Thumbs.db
+# Linux / Vim
+*.swp
+*~
