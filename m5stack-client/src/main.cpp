@@ -1,10 +1,11 @@
 #include <M5Stack.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include <Arduino_JSON.h> 
+#include <Arduino_JSON.h> // JSONパーサー
 
 // ----------------------------------------------
 // ★★ Wi-Fi設定 ★★
+// (platformio.ini / secret.ini から注入される)
 const char* ssid = WIFI_SSID;
 const char* password = WIFI_PASSWORD;
 
@@ -16,6 +17,13 @@ String lastStatus = ""; // 前回のステータスを記憶
 
 void setup() {
   M5.begin();
+
+  // --- ★★★ ここから追加 ★★★ ---
+  // GPIO 2 を出力 (OUTPUT) に設定
+  pinMode(2, OUTPUT);
+  // GPIO 2 の出力を LOW (0V) に設定
+  digitalWrite(2, LOW);
+
   M5.Lcd.setTextSize(6); // 文字サイズを大きく
   M5.Lcd.fillScreen(BLACK);
   M5.Lcd.println("Connecting...");
@@ -52,9 +60,13 @@ void loop() {
           if (currentStatus == "on") {
             M5.Lcd.setTextColor(RED, BLACK); // 赤文字
             M5.Lcd.println(" ONAIR ");
+            // GPIO 2 の出力を HIGH (3.3V) に設定
+            digitalWrite(2, HIGH);
           } else {
             M5.Lcd.setTextColor(GREEN, BLACK); // 緑文字
             M5.Lcd.println("OFFLINE");
+            // GPIO 2 の出力を LOW (0V) に設定
+            digitalWrite(2, LOW);
           }
         }
       }

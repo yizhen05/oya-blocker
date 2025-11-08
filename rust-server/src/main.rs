@@ -11,21 +11,31 @@ use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use dotenvy::dotenv;
 
-// ----------------------------------------------------
-// ★★ 監視したい自分のDiscordユーザーIDを設定 ★★
-const TARGET_USER_ID: u64 = 964540731345743893; 
-// ----------------------------------------------------
+// --- 共有ステートとレスポンスの定義 ---
+
+/// BotとServerで共有するアプリケーションの状態
+#[derive(Clone, Debug)]
+struct SharedStatus {
+    status: String,
+    target_user_id: u64, // ★ IDを定数からステートに移動
+}
 
 /// M5Stackに返すJSONの型
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct VoiceStatus {
+struct VoiceStatusResponse {
     status: String,
 }
 
-/// BotとServerで共有するアプリケーションの状態
-/// RwLock (Read/Write Lock) で排他制御を行う
-type AppState = Arc<RwLock<VoiceStatus>>;
+/// 共有ステート全体 (Arc<RwLock<>>) の型エイリアス
+type AppState = Arc<RwLock<SharedStatus>>;
+
+// SerenityのContextにAppStateを格納するためのキー
+struct AppStateKey;
+impl TypeMapKey for AppStateKey {
+    type Value = AppState;
+}
 
 // --- Discord Bot (Serenity) ---
 
@@ -35,12 +45,21 @@ struct Handler;
 impl EventHandler for Handler {
     /// VCの状態が変化したときに呼ばれる
     async fn voice_state_update(&self, ctx: Context, old: Option<VoiceState>, new: VoiceState) {
+        
+        // ★ 共有ステートから target_user_id を取得
+        let state_lock = ctx.data.read().await;
+        let shared_state_arc = state_lock
+            .get::<AppStateKey>()
+            .expect("Failed to get AppState")
+            .clone(); // AppStateのArcをクローン
+        
+        let target_user_id = shared_state_arc.read().await.target_user_id; // IDを読み取り
+
         // 更新がターゲットユーザーのものかチェック
-        // (注: 退出時は 'new' に user_id がない場合があるので 'old' も見る)
         let user_id = new.user_id.get();
-        if user_id != TARGET_USER_ID {
+        if user_id != target_user_id {
             if let Some(ref old_state) = old {
-                if old_state.user_id.get() != TARGET_USER_ID {
+                if old_state.user_id.get() != target_user_id {
                     return; // ターゲットユーザーではない
                 }
             } else {
@@ -63,12 +82,7 @@ impl EventHandler for Handler {
         };
 
         // 共有ステータスを書き込みロックして更新
-        let state_lock = ctx.data.read().await;
-        let shared_state = state_lock
-            .get::<AppStateKey>()
-            .expect("Failed to get AppState");
-
-        let mut status = shared_state.write().await;
+        let mut status = shared_state_arc.write().await;
         status.status = new_status_str.to_string();
     }
 
@@ -76,46 +90,43 @@ impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         tracing::info!("Discord Bot {} is connected!", ready.user.name);
 
-        // 起動時にVCに参加しているかチェック (Python版の check_initial_vc_status と同じ)
-        let mut initial_status = "off";
-        let target_user_id = UserId::new(TARGET_USER_ID);
+        // ★ 共有ステートを取得
+        let state_lock = ctx.data.read().await;
+        let shared_state_arc = state_lock
+            .get::<AppStateKey>()
+            .expect("Failed to get AppState")
+            .clone();
 
-        // Botが参加している全サーバーをチェック
+        let target_user_id_u64 = shared_state_arc.read().await.target_user_id;
+        let target_user_id = UserId::new(target_user_id_u64); // serenity::model::id::UserId に変換
+
+        // 起動時にVCに参加しているかチェック
+        let mut initial_status = "off";
+
         for guild_id in ctx.cache.guilds() {
             if let Some(guild) = ctx.cache.guild(guild_id) {
                 // サーバーのボイス状態マップにターゲットユーザーがいるか
-                if let Some(voice_state) = guild.voice_states.get(&target_user_id) {
+                if let Some(voice_state) = guild.voice_states.get(&target_user_id) { // ★ 共有IDで検索
                     if voice_state.channel_id.is_some() {
                         tracing::info!("Initial check: User is already in VC.");
                         initial_status = "on";
-                        break; // 見つかったらループを抜ける
+                        break; 
                     }
                 }
             }
         }
 
         // 共有ステータスを更新
-        let state_lock = ctx.data.read().await;
-        let shared_state = state_lock
-            .get::<AppStateKey>()
-            .expect("Failed to get AppState");
-        
-        let mut status = shared_state.write().await;
+        let mut status = shared_state_arc.write().await;
         status.status = initial_status.to_string();
     }
 }
 
-// SerenityのContextにAppStateを格納するためのキー
-struct AppStateKey;
-impl TypeMapKey for AppStateKey {
-    type Value = AppState;
-}
 
 /// Discord Botタスク
 async fn run_discord_bot(shared_state: AppState) {
     let token = env::var("DISCORD_TOKEN").expect("Expected DISCORD_TOKEN in environment");
 
-    // VC状態とサーバーメンバーを監視するインテントを有効化
     let intents = GatewayIntents::GUILD_VOICE_STATES | GatewayIntents::GUILD_MEMBERS | GatewayIntents::GUILDS;
 
     let mut client = Client::builder(&token, intents)
@@ -139,19 +150,22 @@ async fn run_discord_bot(shared_state: AppState) {
 /// M5Stackが /status にGETリクエストしたときのハンドラ
 async fn get_status_handler(
     State(state): State<AppState>, // with_stateで渡された共有ステータス
-) -> Json<VoiceStatus> {
-    // 共有ステータスを読み取りロックして、クローンを返す
-    let status = state.read().await;
-    Json(status.clone())
+) -> Json<VoiceStatusResponse> { // ★ M5Stack用のレスポンス型
+    
+    // status のみ読み取ってクローンする
+    let status_str = state.read().await.status.clone();
+    
+    Json(VoiceStatusResponse {
+        status: status_str
+    })
 }
 
 /// Webサーバータスク
 async fn run_web_server(shared_state: AppState) {
     let app = Router::new()
         .route("/status", get(get_status_handler))
-        .with_state(shared_state); // ハンドラに共有ステータスを渡す
+        .with_state(shared_state); 
 
-    // M5Stackからアクセスできるよう 0.0.0.0 (全インターフェース) で待機
     let addr = SocketAddr::from(([0, 0, 0, 0], 5000));
     tracing::info!("Web server listening on {}", addr);
 
@@ -163,15 +177,29 @@ async fn run_web_server(shared_state: AppState) {
 
 #[tokio::main]
 async fn main() {
-    // トレース（ログ）の初期化
+    // 1. .env ファイルから環境変数を読み込む
+    dotenv().ok(); 
+    
+    // 2. トレース（ログ）の初期化
     tracing_subscriber::fmt::init();
 
-    // 1. 共有ステータスを初期化
-    let shared_state = Arc::new(RwLock::new(VoiceStatus {
-        status: "off".to_string(), // 初期値
+    // ★ 3. .env から TARGET_USER_ID を読み込む
+    let target_user_id_str = env::var("TARGET_USER_ID")
+        .expect("Expected TARGET_USER_ID in environment");
+    // 文字列からu64（数値）に変換
+    let target_user_id = target_user_id_str
+        .parse::<u64>()
+        .expect("TARGET_USER_ID must be a valid u64 (number)");
+
+    tracing::info!("Target User ID set to: {}", target_user_id);
+
+    // 4. 共有ステータスを初期化 (IDもセット)
+    let shared_state = Arc::new(RwLock::new(SharedStatus {
+        status: "off".to_string(), 
+        target_user_id: target_user_id, // ★ 読み込んだIDをセット
     }));
 
-    // 2. WebサーバーとDiscord Botを並行実行
+    // 5. WebサーバーとDiscord Botを並行実行
     tracing::info!("Starting services...");
     tokio::select! {
         _ = run_web_server(shared_state.clone()) => {
